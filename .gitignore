@@ -1,7 +1,17 @@
-venv/
+# Python
 __pycache__/
 *.pyc
-.DS_Store
-.env
-.env.local
+*.pyo
+*.pyd
 
+# Virtual env
+venv/
+.env/
+.venv/
+
+# OS/editor
+.DS_Store
+
+# Backups and temp
+*.save
+*.swp

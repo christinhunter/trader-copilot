@@ -1,0 +1,567 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
+
+# Optional: auto-refresh component. If not installed, we gracefully fallback.
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
+
+# Optional: auto-refresh component. If not installed, we gracefully fallback.
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+source ~/trader_copilot_clean/venv/bin/activate
+pip install streamlit-autorefresh
+from concurrent.futures import ThreadPoolExecutor
+
+st.set_page_config(page_title="Trader Copilot", layout="wide")
+# =========================================
+# Intraday helpers for "Today movers"
+# =========================================
+@st.cache_data(ttl=120, show_spinner=False)
+def yf_intraday_today(ticker: str) -> pd.DataFrame:
+    """
+    Return 1-minute intraday for today (and yesterday for context) if available.
+    Schema like yfinance download: index is Datetime, columns Open, High, Low, Close, Volume.
+    """
+    try:
+        df = yf.download(ticker, period="2d", interval="1m", auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.tz_localize(None) if df.index.tz is not None else df
+        # keep today only for metrics; we keep 2d to get first open for gap
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _today_mask(idx) -> pd.Series:
+    # Compare date part to "today" in local system time
+    import pandas as _pd
+    today = _pd.Timestamp.today().normalize()
+    return (idx >= today) & (idx < today + _pd.Timedelta(days=1))
+
+@st.cache_data(ttl=300, show_spinner=False)
+def intraday_metrics(ticker: str):
+    """
+    Compute simple 'today' metrics:
+    - prev_close (yesterday's close)
+    - open_today
+    - last_today
+    - day_change_pct
+    - gap_pct (open_today vs prev_close)
+    - vol_today, avg_vol20, rel_vol (today vs 20d avg)
+    """
+    # daily for prev close and avg vol
+    daily = yf_ohlc_daily(ticker, 25)
+    if daily.empty:
+        return None
+    prev_close = float(daily["close"].iloc[-2]) if len(daily) >= 2 else float(daily["close"].iloc[-1])
+    avg_vol20 = float(daily["volume"].tail(20).mean()) if "volume" in daily.columns and len(daily) >= 2 else np.nan
+
+    # intraday for today open/last and volume
+    intra = yf_intraday_today(ticker)
+    if intra.empty:
+        return None
+
+    # mask for today rows
+    mask_today = _today_mask(intra.index)
+    today_df = intra[mask_today]
+    if today_df.empty:
+        return None
+
+    open_today = float(today_df["Open"].iloc[0]) if "Open" in today_df.columns else np.nan
+    last_today = float(today_df["Close"].iloc[-1]) if "Close" in today_df.columns else np.nan
+    vol_today = float(today_df["Volume"].sum()) if "Volume" in today_df.columns else np.nan
+
+    gap_pct = ((open_today / prev_close - 1.0) * 100.0) if prev_close and not np.isnan(open_today) else 0.0
+    day_change_pct = ((last_today / prev_close - 1.0) * 100.0) if prev_close and not np.isnan(last_today) else 0.0
+    rel_vol = (vol_today / avg_vol20) if avg_vol20 and not np.isnan(avg_vol20) else np.nan
+
+    return {
+        "prev_close": prev_close,
+        "open_today": open_today,
+        "last_today": last_today,
+        "day_change_pct": day_change_pct,
+        "gap_pct": gap_pct,
+        "vol_today": vol_today,
+        "avg_vol20": avg_vol20,
+        "rel_vol": rel_vol,
+    }
+
+@st.cache_data(ttl=180, show_spinner=False)
+def scan_today_movers(universe, lookback_for_context: int = 30, max_workers: int = 12):
+    """
+    Rank today's movers using day_change, gap, and relative volume, with a small trend context.
+    Returns (df, errs).
+    """
+    # context: SPY today change for relative comparison
+    spy_m = intraday_metrics("SPY")
+    spy_change = spy_m["day_change_pct"] if spy_m else 0.0
+
+    # get a small trend context score
+    def trend_score(t):
+        df = add_indicators(yf_ohlc_daily(t, lookback_for_context))
+        if df.empty:
+            return 0.0
+        bias, base, _ = classify_trend(df.iloc[-1])
+        return float(base)
+
+    out, errs = [], []
+
+    def work(t):
+        try:
+            m = intraday_metrics(t)
+            if not m:
+                return t, None, "no intraday"
+            base = trend_score(t)
+
+            day_change = float(m["day_change_pct"] or 0.0)
+            rel_day = day_change - spy_change  # today's RS vs SPY
+            gap = float(m["gap_pct"] or 0.0)
+            rel_vol = float(m["rel_vol"] or 0.0)
+
+            # Composite 'today' score: weight current move and activity
+            score = 0.6 * rel_day + 0.2 * gap + 0.2 * (np.log1p(rel_vol) * 100.0 if rel_vol > 0 else 0.0)
+            score += 0.3 * base  # add a little trend bias
+
+            row = {
+                "ticker": t,
+                "today_score": round(score, 3),
+                "day_change_pct": round(day_change, 2),
+                "rel_day_pct": round(rel_day, 2),
+                "gap_pct": round(gap, 2),
+                "rel_vol": round(rel_vol, 2) if not np.isnan(rel_vol) else np.nan,
+            }
+            return t, row, None
+        except Exception as e:
+            return t, None, str(e)
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(universe)))) as ex:
+        for f in [ex.submit(work, t) for t in universe]:
+            t, row, err = f.result()
+            if err:
+                errs.append((t, err))
+            elif row:
+                out.append(row)
+
+    cols = ["ticker","today_score","day_change_pct","rel_day_pct","gap_pct","rel_vol"]
+    if not out:
+        return pd.DataFrame(columns=cols), errs
+
+    df = pd.DataFrame(out)
+    df["today_score"] = pd.to_numeric(df["today_score"], errors="coerce").fillna(0.0)
+    df = df.sort_values("today_score", ascending=False).reset_index(drop=True)
+    return df, errs
+
+# =========================================
+# Robust Yahoo daily fetch with fallbacks
+# =========================================
+@st.cache_data(ttl=600, show_spinner=False)
+def yf_ohlc_daily(ticker: str, lookback_days: int) -> pd.DataFrame:
+    """
+    Robust daily fetch that tries three strategies and always returns the
+    same schema: columns = ['date','open','high','low','close','volume'].
+    """
+    cols = ["date", "open", "high", "low", "close", "volume"]
+
+    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        df = df.reset_index()
+        # Accept either Date or already date
+        if "Date" in df.columns and "date" not in df.columns:
+            df = df.rename(columns={"Date": "date"})
+        # Some paths already have lower-case column names
+        need = {"date", "Open", "High", "Low", "Close", "Volume"}
+        if not need.issubset(set(df.columns)):
+            # Try to construct from lower-case
+            alt = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
+            for lo, up in alt.items():
+                if lo in df.columns and up not in df.columns:
+                    df[up] = df[lo]
+            if "date" not in df.columns and "Date" in df.columns:
+                df["date"] = df["Date"]
+        if not need.issubset(set(df.columns)):
+            return pd.DataFrame(columns=cols)
+
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+        if "close" in df.columns:
+            df = df.dropna(subset=["close"])
+        df = df.tail(int(lookback_days)).reset_index(drop=True)
+        df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+        return df[cols]
+
+    extra = max(int(lookback_days) + 10, 20)
+
+    # Strategy 1: download with period
+    try:
+        df1 = yf.download(
+            ticker, period=f"{extra}d", interval="1d",
+            auto_adjust=False, progress=False, threads=False
+        )
+        n1 = _normalize(df1)
+        if not n1.empty:
+            return n1
+    except Exception:
+        pass
+
+    # Strategy 2: history with explicit start
+    try:
+        import pandas as _pd
+        start = _pd.bdate_range(end=_pd.Timestamp.today(tz=None), periods=max(int(lookback_days)+20, 30))[0]
+        tk = yf.Ticker(ticker)
+        df2 = tk.history(start=start.tz_localize(None), interval="1d", auto_adjust=False)
+        n2 = _normalize(df2)
+        if not n2.empty:
+            return n2
+    except Exception:
+        pass
+
+    # Strategy 3: last month period as last resort
+    try:
+        df3 = yf.download(ticker, period="1mo", interval="1d", auto_adjust=False, progress=False, threads=False)
+        n3 = _normalize(df3)
+        if not n3.empty:
+            return n3.tail(int(lookback_days))
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=cols)
+
+# =========================================
+# Indicators and narrative
+# =========================================
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    p = df["close"].astype(float)
+
+    # returns
+    df["ret"] = p.pct_change()
+    df["ret5"] = p.pct_change(5)
+    df["ret20"] = p.pct_change(20)
+
+    # SMAs and slopes
+    for n in (20, 50, 200):
+        df[f"sma{n}"] = p.rolling(n, min_periods=1).mean()
+        df[f"slope{n}"] = df[f"sma{n}"].pct_change().rolling(5, min_periods=1).mean()
+
+    # ATR(14) percent
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(14, min_periods=1).mean()
+    df["atrp"] = (df["atr14"] / df["close"]) * 100.0
+
+    # RSI(14)
+    delta = p.diff()
+    gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+    loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean().replace(0, np.nan)
+    rs = gain / loss
+    df["rsi14"] = 100 - (100 / (1 + rs))
+
+    # Floor pivots using prior day
+    df["prev_high"] = df["high"].shift(1)
+    df["prev_low"] = df["low"].shift(1)
+    df["prev_close"] = df["close"].shift(1)
+    pp = (df["prev_high"] + df["prev_low"] + df["prev_close"]) / 3.0
+    df["pivot"] = pp
+    df["r1"] = 2 * pp - df["prev_low"]
+    df["s1"] = 2 * pp - df["prev_high"]
+    df["r2"] = pp + (df["prev_high"] - df["prev_low"])
+    df["s2"] = pp - (df["prev_high"] - df["prev_low"])
+    return df
+
+def classify_trend(row: pd.Series):
+    score = 0.0
+    notes = []
+    for n in (20, 50, 200):
+        v = row.get(f"sma{n}")
+        if pd.notna(v) and row["close"] > v:
+            score += 1
+            notes.append(f"above {n}sma")
+    for n in (20, 50, 200):
+        s = row.get(f"slope{n}")
+        if pd.notna(s):
+            score += 0.5 if s > 0 else (-0.5 if s < 0 else 0)
+    rsi = row.get("rsi14")
+    if pd.notna(rsi):
+        if rsi >= 60: score += 0.5
+        elif rsi <= 40: score -= 0.5
+
+    if score >= 3: bias = "Strong uptrend"
+    elif score >= 1.5: bias = "Uptrend"
+    elif score <= -3: bias = "Strong downtrend"
+    elif score <= -1.5: bias = "Downtrend"
+    else: bias = "Sideways"
+    return bias, round(score, 2), ", ".join(notes)
+
+def narrative_from_df(ticker: str, df: pd.DataFrame) -> str:
+    if df.empty:
+        return f"**{ticker}**\n- No data."
+    last = df.iloc[-1]
+    bias, score, notes = classify_trend(last)
+    atrp = float(last.get("atrp") or 0)
+    vol = "high volatility" if atrp >= 3 else ("medium volatility" if atrp >= 1.5 else "low volatility")
+
+    levels = []
+    for key, label in [("pivot","Pivot"), ("r1","R1"), ("s1","S1"), ("prev_high","Prev H"), ("prev_low","Prev L")]:
+        v = last.get(key)
+        if pd.notna(v): levels.append(f"{label} {float(v):.2f}")
+    ma_levels = []
+    for n in (20,50,200):
+        v = last.get(f"sma{n}")
+        if pd.notna(v): ma_levels.append(f"SMA{n} {float(v):.2f}")
+
+    if "Uptrend" in bias:
+        plays = ["Buy pullbacks near SMA20 or pivot", "Breakout through R1 or prior high"]
+    elif "Downtrend" in bias:
+        plays = ["Fade pops into SMA20 or pivot", "Breakdown under S1 or prior low"]
+    else:
+        plays = ["Mean reversion between S1 and R1", "Trade range breaks with volume"]
+
+    risk = ("Half size. Wider stops near S2 or R2" if vol == "high volatility"
+            else "Standard size. Stops beyond S1 or R1" if vol == "medium volatility"
+            else "Small targets. Quick scalps or premium selling")
+
+    return (
+        f"**{ticker}**\n"
+        f"- Bias: {bias} (score {score}; {notes})\n"
+        f"- Volatility: {vol} (ATR% {atrp:.2f})\n"
+        f"- Key levels: {', '.join(levels)} | {', '.join(ma_levels)}\n"
+        f"- Plays: {plays[0]}; {plays[1]}\n"
+        f"- Risk: {risk}"
+    )
+
+# =========================================
+# Scanner using Yahoo
+# =========================================
+@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_universe_yf(tickers, lookback: int, max_workers: int = 12):
+    # Baseline for relative strength
+    spy = add_indicators(yf_ohlc_daily("SPY", lookback))
+    spy20 = 0.0
+    try:
+        v = spy.iloc[-1].get("ret20", 0)
+        spy20 = float(v) if pd.notna(v) else 0.0
+    except Exception:
+        pass
+
+    out, errs = [], []
+
+    def work(t):
+        try:
+            base = yf_ohlc_daily(t, lookback)
+            if base.empty or len(base) == 0:
+                return t, None, "empty"
+            df = add_indicators(base)
+            r = df.iloc[-1]
+
+            # Trend bias from SMAs and slopes
+            bias, base_score, _ = classify_trend(r)
+            base_score = float(base_score) if pd.notna(base_score) else 0.0
+
+            # Components with robust NaN handling
+            sma20 = r.get("sma20")
+            close = r.get("close")
+            dist20 = 0.0
+            if pd.notna(sma20) and sma20 and pd.notna(close) and close:
+                dist20 = (float(close) / float(sma20) - 1.0) * 100.0
+
+            mom5 = r.get("ret5", 0.0)
+            mom5 = float(mom5) * 100.0 if pd.notna(mom5) else 0.0
+
+            ret20 = r.get("ret20", 0.0)
+            rs20 = float(ret20 - spy20) * 100.0 if pd.notna(ret20) else 0.0
+
+            score = float(base_score) + 0.01 * float(dist20) + 0.1 * float(mom5) + 0.1 * float(rs20)
+
+            row = {
+                "ticker": t,
+                "bias": bias,
+                "score": round(score, 3),
+                "close": round(float(close), 2) if pd.notna(close) else np.nan,
+                "atrp": round(float(r.get("atrp", 0.0) or 0.0), 2),
+                "rsi14": round(float(r.get("rsi14", 0.0) or 0.0), 2),
+                "sma20": round(float(sma20), 2) if pd.notna(sma20) else np.nan,
+                "sma50": round(float(r.get("sma50", 0.0) or 0.0), 2),
+                "pivot": round(float(r.get("pivot", 0.0) or 0.0), 2),
+                "r1": round(float(r.get("r1", 0.0) or 0.0), 2),
+                "s1": round(float(r.get("s1", 0.0) or 0.0), 2),
+            }
+            return t, row, None
+        except Exception as e:
+            return t, None, str(e)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(tickers)))) as ex:
+        for f in [ex.submit(work, t) for t in tickers]:
+            t, row, err = f.result()
+            if err:
+                errs.append((t, err))
+            elif row:
+                out.append(row)
+
+    cols = ["ticker","bias","score","close","atrp","rsi14","sma20","sma50","pivot","r1","s1"]
+    if not out:
+        return pd.DataFrame(columns=cols), errs
+
+    df = pd.DataFrame(out)
+    # Ensure score is numeric and not NaN
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
+    df = df.sort_values("score", ascending=False).reset_index(drop=True)
+    return df, errs
+
+# =========================================
+# Options via Yahoo
+# =========================================
+@st.cache_data(ttl=900, show_spinner=False)
+def yf_nearest_chain(ticker: str):
+    try:
+        tk = yf.Ticker(ticker)
+        exps = tk.options
+        if not exps:
+            return pd.DataFrame(), "no expirations"
+        expiry = sorted(exps)[0]  # nearest
+        ch = tk.option_chain(expiry)
+        calls = ch.calls.copy(); calls["type"] = "CALL"
+        puts  = ch.puts.copy();  puts["type"]  = "PUT"
+        df = pd.concat([calls, puts], ignore_index=True, sort=False)
+        rename = {
+            "contractSymbol":"symbol","lastPrice":"last","bid":"bid","ask":"ask",
+            "volume":"volume","openInterest":"open_interest",
+            "impliedVolatility":"iv","strike":"strike","inTheMoney":"itm"
+        }
+        df = df.rename(columns=rename)
+        keep = ["symbol","type","strike","last","bid","ask","volume","open_interest","iv","itm"]
+        df = df[[c for c in keep if c in df.columns]].sort_values(["type","strike"]).reset_index(drop=True)
+        if "iv" in df.columns:
+            df["iv"] = (df["iv"]*100).round(2)
+        return df, expiry
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+# =========================================
+# Sidebar controls
+# =========================================
+st.sidebar.title("Trader Copilot")
+st.sidebar.checkbox("Show data diagnostics", key="diag", help="Print raw rows per fetch")
+
+lookback_days = st.sidebar.slider(
+    "Lookback trading days",
+    min_value=1, max_value=365, value=30, step=1,
+    help="Controls AI Game Plan and Scanner",
+    key="global_lookback"
+)
+page = st.sidebar.radio("Go to", ["Chains", "AI Game Plan", "Scanner", "About"], key="nav_radio")
+
+# =========================================
+# Pages
+# =========================================
+if page == "Chains":
+    st.header("Option Chains — nearest expiry from Yahoo")
+    tickers = st.text_input("Tickers (comma separated)", "SPY,NVDA,QQQ")
+    calls_only = st.checkbox("Calls only", True, key="chains_calls")
+    if st.button("Get Chains", key="chains_go"):
+        for t in [x.strip().upper() for x in tickers.split(",") if x.strip()]:
+            df, meta = yf_nearest_chain(t)
+            if df.empty:
+                st.warning(f"{t}: unable to fetch chain ({meta})")
+                continue
+            if calls_only and "type" in df.columns:
+                df = df[df["type"] == "CALL"]
+            st.subheader(f"{t} — nearest expiry: {meta}")
+            st.dataframe(df, use_container_width=True)
+
+elif page == "AI Game Plan":
+    st.header("AI Game Plan from Trends")
+    tickers = st.text_input("Tickers (comma separated)", "SPY,NVDA,QQQ")
+    st.caption(f"Using last {lookback_days} trading days")
+    if st.button("Generate plan", key="gp_go"):
+        for t in [x.strip().upper() for x in tickers.split(",") if x.strip()]:
+            base = yf_ohlc_daily(t, lookback_days)
+            if st.session_state.get("diag"):
+                st.caption(f"{t} raw rows: {len(base)}")
+                if not base.empty:
+                    st.dataframe(base.tail(5), use_container_width=True)
+            df = add_indicators(base)
+            st.markdown(narrative_from_df(t, df))
+            if not df.empty:
+                st.dataframe(
+                    df.tail(3)[["date","close","sma20","sma50","sma200","rsi14","atrp","pivot","r1","s1"]],
+                    use_container_width=True
+                )
+
+    st.header("Daily Scanner")
+    ...
+elif page == "Scanner":
+    st.header("Scanner")
+
+    # Choose scan type
+    scan_mode = st.radio(
+        "Mode",
+        ["Today movers", "Trend score"],
+        index=0,
+        key="scanner_mode_radio"
+    )
+
+    # Editable universe in the UI
+    default_universe = "SPY,QQQ,NVDA,AAPL,MSFT,AMZN,META,GOOGL,TSLA,AVGO,AMD,CRM,COST,ORCL,GE,INTC,NFLX,REGN,LLY,XOM,CVX,BA,JPM,V,MA,WMT,HD,LOW,KO,MCD,UNH"
+    tickers_text = st.text_area("Universe (comma separated)", default_universe, height=110)
+    universe = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+
+    colA, colB = st.columns(2)
+    with colA:
+        topn = st.slider("Show top N", 5, 50, 15, key="scanner_topn")
+    with colB:
+        st.caption(f"Context lookback for trend: {lookback_days} trading days")
+
+    run = st.button("Run scan", key="scanner_go")
+    if not run:
+        st.info("Set your universe, choose a mode, then click Run scan.")
+    else:
+        if not universe:
+            st.warning("Please enter at least one ticker.")
+        else:
+            if scan_mode == "Today movers":
+                df, errs = scan_today_movers(universe, lookback_for_context=lookback_days)
+                if df.empty:
+                    st.warning("No intraday data found. Markets might be closed or Yahoo did not return minutes.")
+                else:
+                    st.success(f"Top {min(topn, len(df))} of {len(df)} by Today score")
+                    st.dataframe(df.head(topn), use_container_width=True)
+                if errs:
+                    with st.expander("Errors"):
+                        for t, e in errs[:100]:
+                            st.write(f"{t} → {e}")
+            else:
+                # Trend score mode
+                df, errs = scan_universe_yf(universe, lookback_days)
+                if df.empty:
+                    st.warning("No results.")
+                else:
+                    st.success(f"Top {min(topn, len(df))} of {len(df)} by Trend score")
+                    st.dataframe(df.head(topn), use_container_width=True)
+                if errs:
+                    with st.expander("Errors"):
+                        for t, e in errs[:100]:
+                            st.write(f"{t} → {e}")
+
+else:
+    st.header("About")
+    st.write("This build uses Yahoo Finance for daily bars and option chains. No external API keys needed.")
+    st.write("Global lookback slider drives both the Game Plan and the Scanner.")
+

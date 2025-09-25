@@ -1,3 +1,7 @@
+# app.py — Trader Copilot (full)
+# Scanner + AI plan + Options + Projected Strike + Candlestick Chart
+# Uses yfinance. No broker connection. RSI and SMAs overlaid on price.
+
 import os
 import math
 import numpy as np
@@ -8,13 +12,47 @@ import requests
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 # ---------------- Page and sidebar ----------------
 st.set_page_config(page_title="Trader Copilot", layout="wide")
 st.sidebar.title("Trader Copilot")
 
-# Global lookback choices used by all tabs
-LOOKBACK_CHOICES = [1, 3, 7, 30, 90]
-lookback_days = st.sidebar.selectbox("Lookback (trading days)", LOOKBACK_CHOICES, index=4)
+# -------- Lookback preset (adds intraday choices) --------
+LOOKBACK_PRESETS = [
+    "Realtime",
+    "Last 5 minutes",
+    "Last 10 minutes",
+    "Last 15 minutes",
+    "Last 1 hour",
+    "Last 2 hours",
+    "Last 3 hours",
+    "1 trading day",
+    "3 trading days",
+    "7 trading days",
+    "30 trading days",
+    "90 trading days",
+]
+lookback_preset = st.sidebar.selectbox("Lookback Preset", LOOKBACK_PRESETS, index=0, key="lb_preset")
+
+# For Scanner and AI tabs we still use daily bars and a “days” window:
+PRESET_TO_DAILY_DAYS = {
+    "Realtime": 1,
+    "Last 5 minutes": 1,
+    "Last 10 minutes": 1,
+    "Last 15 minutes": 1,
+    "Last 1 hour": 1,
+    "Last 2 hours": 1,
+    "Last 3 hours": 1,
+    "1 trading day": 1,
+    "3 trading days": 3,
+    "7 trading days": 7,
+    "30 trading days": 30,
+    "90 trading days": 90,
+}
+lookback_days = PRESET_TO_DAILY_DAYS.get(lookback_preset, 90)
+st.sidebar.caption(f"Using daily bars. Effective window: {lookback_days} trading day(s).")
 
 # Universe: top 30 tech tickers (editable)
 TOP30_TECH = [
@@ -29,7 +67,7 @@ UNIVERSE = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-# ---------------- Helpers: prices ----------------
+# ---------------- Shared helpers ----------------
 @st.cache_data(ttl=600, show_spinner=False)
 def yf_ohlc_daily(ticker: str, lookback: int) -> pd.DataFrame:
     cols = ["date","open","high","low","close","volume"]
@@ -221,13 +259,6 @@ def gpt_plan(tkr: str, row: pd.Series) -> str:
         return rule_based_plan(row)
 
 # ---------------- Helpers: Options ----------------
-def next_friday(from_dt: datetime) -> datetime:
-    # Friday is weekday 4
-    days_ahead = (4 - from_dt.weekday()) % 7
-    if days_ahead == 0 and from_dt.hour >= 13:
-        return from_dt.date()
-    return (from_dt + timedelta(days=days_ahead)).date()
-
 def cnd(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -349,12 +380,10 @@ def projected_strikes_dual(ticker: str) -> dict:
         if chosen is None:
             chosen = datetime.strptime(exps[0], "%Y-%m-%d").date()
         days_left = days_until_expiry_date(chosen)
-        opt = tk.option_chain(chosen.strftime("%Y-%m-%d"))
-        calls = opt.calls.copy() if hasattr(opt, "calls") else pd.DataFrame()
+        _ = tk.option_chain(chosen.strftime("%Y-%m-%d"))
     except Exception:
         chosen = None
         days_left = 0
-        calls = pd.DataFrame()
 
     a3_pct = avg_3d_pct_change(base)
     proj_pct = last_close * ((1.0 + a3_pct) ** max(days_left, 0))
@@ -366,27 +395,6 @@ def projected_strikes_dual(ticker: str) -> dict:
     guess_pct = round_to_increment(proj_pct, inc)
     guess_usd = round_to_increment(proj_usd, inc)
 
-    rec_pct = guess_pct
-    rec_usd = guess_usd
-    preview = pd.DataFrame()
-
-    if not calls.empty and "strike" in calls.columns:
-        calls = calls.copy()
-        calls["dist_pct"] = (calls["strike"] - proj_pct).abs()
-        calls["dist_usd"] = (calls["strike"] - proj_usd).abs()
-        calls["dist_min"] = calls[["dist_pct", "dist_usd"]].min(axis=1)
-
-        calls_sorted_pct = calls.sort_values("dist_pct")
-        calls_sorted_usd = calls.sort_values("dist_usd")
-        rec_pct = float(calls_sorted_pct.iloc[0]["strike"])
-        rec_usd = float(calls_sorted_usd.iloc[0]["strike"])
-
-        prev = calls.sort_values("dist_min").head(12).copy()
-        prev["mid"] = (prev["bid"].fillna(0) + prev["ask"].fillna(0)) / 2.0
-        preview = prev[[
-            "contractSymbol","strike","bid","ask","mid","volume","openInterest","dist_pct","dist_usd","dist_min"
-        ]].reset_index(drop=True)
-
     return {
         "close": last_close,
         "days_left": days_left,
@@ -395,15 +403,15 @@ def projected_strikes_dual(ticker: str) -> dict:
         "avg3_usd": a3_usd,
         "projection_pct": proj_pct,
         "projection_usd": proj_usd,
-        "rec_strike_pct": rec_pct,
-        "rec_strike_usd": rec_usd,
-        "chain_df": preview
+        "rec_strike_pct": guess_pct,
+        "rec_strike_usd": guess_usd,
+        "chain_df": pd.DataFrame(),  # preview optional
     }
 
 # ---------------- UI Tabs ----------------
 page = st.sidebar.radio(
     "Go to",
-    ["Scanner", "AI Game Plan", "Options (Best Calls)", "Projected Strike", "About"],
+    ["Scanner", "AI Game Plan", "Options (Best Calls)", "Projected Strike", "Chart", "About"],
     index=0,
     key="nav"
 )
@@ -448,7 +456,6 @@ elif page == "Options (Best Calls)":
         df_calls = pd.DataFrame()
         expiry_date = None
         try:
-            # Polygon attempt could go here if you want to wire it later
             raise Exception("Use Yahoo fallback")
         except Exception:
             df_calls, expiry_date = yf_best_calls_for_friday(tkr)
@@ -502,15 +509,170 @@ elif page == "Projected Strike":
             s1.write(f"Nearest to percent model: **{res['rec_strike_pct']:.2f}**")
             s2.write(f"Nearest to dollar model: **{res['rec_strike_usd']:.2f}**")
 
-            dfp = res.get("chain_df")
-            if isinstance(dfp, pd.DataFrame) and not dfp.empty:
-                st.caption("Nearest available strikes by distance to either projection")
-                st.dataframe(dfp, use_container_width=True)
-            else:
-                st.info("No chain preview available. Strike suggestions above are still valid.")
+# --------- Chart (candlesticks + SMAs + RSI overlay) ---------
+elif page == "Chart":
+    st.header("Candlestick chart")
+
+    def default_interval_for_preset(preset: str) -> str:
+        mapping = {
+            "Realtime": "1m",
+            "Last 5 minutes": "1m",
+            "Last 10 minutes": "1m",
+            "Last 15 minutes": "15m",
+            "Last 1 hour": "5m",
+            "Last 2 hours": "5m",
+            "Last 3 hours": "5m",
+            "1 trading day": "1d",
+            "3 trading days": "1d",
+            "7 trading days": "1d",
+            "30 trading days": "1d",
+            "90 trading days": "1d",
+        }
+        return mapping.get(preset, "1d")
+
+    def default_period_for_interval(interval: str) -> str:
+        # yfinance needs period length to fetch intraday bars
+        return {
+            "1m": "5d",
+            "5m": "30d",
+            "15m": "60d",
+            "60m": "730d",
+            "1d": f"{max(lookback_days + 20, 40)}d",
+        }.get(interval, f"{max(lookback_days + 20, 40)}d")
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def fetch_candles(ticker: str, interval: str, period: str) -> pd.DataFrame:
+        try:
+            raw = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if raw is None or raw.empty:
+                return pd.DataFrame()
+            df = raw.rename(
+                columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}
+            ).dropna()
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        s = series.astype(float)
+        delta = s.diff()
+        gain = (delta.clip(lower=0)).rolling(period, min_periods=period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
+        rs = gain / loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    default_tkr = UNIVERSE[0] if UNIVERSE else "AAPL"
+    tkr = st.text_input("Ticker", default_tkr).strip().upper()
+
+    preset_interval = default_interval_for_preset(lookback_preset)
+    interval = st.selectbox(
+        "Interval",
+        ["1m", "5m", "15m", "60m", "1d"],
+        index=["1m", "5m", "15m", "60m", "1d"].index(preset_interval),
+    )
+    period = default_period_for_interval(interval)
+
+    topA, topB, topC = st.columns([1, 1, 1])
+    with topA:
+        bars = st.number_input("Bars (display)", min_value=50, max_value=2000, value=300, step=50)
+    with topB:
+        show_sma20 = st.checkbox("SMA20", value=True)
+        show_sma50 = st.checkbox("SMA50", value=True)
+        show_sma200 = st.checkbox("SMA200", value=False)
+    with topC:
+        rsi_len = st.number_input("RSI period", min_value=5, max_value=50, value=14, step=1)
+        st.caption(f"Preset → default interval: **{preset_interval}**")
+
+    if preset_interval != "1d" and interval == "1d":
+        st.info("Preset is intraday. Consider 1m/5m/15m/60m for more detail.")
+
+    # last price and change vs prior close
+    last_price = np.nan
+    prev_close = np.nan
+    try:
+        tk = yf.Ticker(tkr)
+        fi = getattr(tk, "fast_info", {}) or {}
+        if "last_price" in fi:
+            last_price = float(fi["last_price"])
+        h = tk.history(period="5d", interval="1d")
+        if h is not None and len(h) >= 2:
+            prev_close = float(h["Close"].iloc[-2])
+            if np.isnan(last_price):
+                last_price = float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    m1, m2, m3 = st.columns(3)
+    if not np.isnan(last_price) and not np.isnan(prev_close) and prev_close > 0:
+        m1.metric("Last", f"{last_price:.2f}", f"{(last_price - prev_close):+,.2f} ({(last_price/prev_close-1)*100:+.2f}%)")
+    elif not np.isnan(last_price):
+        m1.metric("Last", f"{last_price:.2f}")
+    else:
+        m1.metric("Last", "—")
+    m2.metric("Preset", lookback_preset)
+    m3.metric("Interval", interval)
+
+    dfc = fetch_candles(tkr, interval=interval, period=period)
+    if dfc.empty:
+        st.warning("No chart data for this ticker or interval. Try a different interval or fewer bars.")
+    else:
+        plot_df = dfc.tail(int(bars)).copy()
+        if show_sma20:
+            plot_df["sma20"] = plot_df["close"].rolling(20, min_periods=1).mean()
+        if show_sma50:
+            plot_df["sma50"] = plot_df["close"].rolling(50, min_periods=1).mean()
+        if show_sma200:
+            plot_df["sma200"] = plot_df["close"].rolling(200, min_periods=1).mean()
+        plot_df["rsi"] = rsi(plot_df["close"], int(rsi_len))
+
+        # One figure, RSI on secondary y-axis, everything overlaid
+        fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+        # Candles
+        fig.add_trace(
+            go.Candlestick(
+                x=plot_df.index,
+                open=plot_df["open"],
+                high=plot_df["high"],
+                low=plot_df["low"],
+                close=plot_df["close"],
+                name="Price",
+                increasing_line_width=2,
+                decreasing_line_width=2,
+            ),
+            row=1, col=1, secondary_y=False
+        )
+        # SMAs
+        if "sma20" in plot_df:
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["sma20"], name="SMA20", mode="lines"), secondary_y=False)
+        if "sma50" in plot_df:
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["sma50"], name="SMA50", mode="lines"), secondary_y=False)
+        if "sma200" in plot_df:
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["sma200"], name="SMA200", mode="lines"), secondary_y=False)
+        # RSI on secondary axis
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["rsi"], name=f"RSI({int(rsi_len)})", mode="lines"), secondary_y=True)
+        # RSI bands
+        fig.add_hline(y=70, line_width=1, line_dash="dash", line_color="red", secondary_y=True)
+        fig.add_hline(y=30, line_width=1, line_dash="dash", line_color="green", secondary_y=True)
+
+        fig.update_yaxes(title_text="Price", secondary_y=False)
+        fig.update_yaxes(title_text="RSI", range=[0, 100], secondary_y=True)
+
+        fig.update_layout(
+            height=700,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_rangeslider_visible=False,
+            showlegend=True,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 # About
 else:
     st.header("About")
-    st.write("Scanner, AI plan, best weekly calls, and projected strike. Data via Yahoo Finance. OpenAI key optional for AI plans. Polygon key can be added later for options.")
-
+    st.write("Scanner, AI plan, best weekly calls, projected strike, and candlestick chart with SMAs + RSI. Data via Yahoo Finance. OpenAI key optional for AI plans.")

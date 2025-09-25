@@ -1,11 +1,6 @@
-streamlit
-pandas
-numpy
-yfinance
-requests
-openai
-streamlit
-yfinance
-pandas
-numpy
-requests
+streamlit>=1.36
+yfinance>=0.2.38
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+plotly>=5.22
